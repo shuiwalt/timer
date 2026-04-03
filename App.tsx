@@ -1,10 +1,13 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Haptics from "expo-haptics";
+import * as Notifications from "expo-notifications";
 import { StatusBar } from "expo-status-bar";
 import * as Speech from "expo-speech";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
+  AppState,
+  AppStateStatus,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -27,6 +30,26 @@ type AlertSoundOption = "Chime" | "Bell" | "Beep";
 const DEFAULT_PRESET_MINUTES = [1, 3, 5] as const;
 const SAVED_PRESETS_KEY = "kicktalk.presetMinutes.v3";
 const HISTORY_KEY = "kicktalk.sessionHistory.v2";
+const TIMER_STATE_KEY = "kicktalk.activeTimer.v1";
+
+type PersistedTimerState = {
+  totalSeconds: number;
+  remainingSeconds: number;
+  isRunning: boolean;
+  hasStartedTicking: boolean;
+  activePurpose: string;
+  targetEndTimeMs: number | null;
+  scheduledNotificationId: string | null;
+};
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 const formatSeconds = (seconds: number) => {
   const mins = Math.floor(seconds / 60)
@@ -71,6 +94,8 @@ export default function App() {
   const [remainingSeconds, setRemainingSeconds] = useState(60);
   const [isRunning, setIsRunning] = useState(false);
   const [hasStartedTicking, setHasStartedTicking] = useState(false);
+  const [targetEndTimeMs, setTargetEndTimeMs] = useState<number | null>(null);
+  const [scheduledNotificationId, setScheduledNotificationId] = useState<string | null>(null);
 
   const [minutesInput, setMinutesInput] = useState("1");
   const [secondsInput, setSecondsInput] = useState("00");
@@ -95,6 +120,61 @@ export default function App() {
   const [showAlertSoundDropdown, setShowAlertSoundDropdown] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [vibrationEnabled, setVibrationEnabled] = useState(true);
+  const completionInFlightRef = useRef(false);
+
+  const cancelScheduledTimerNotification = async () => {
+    if (!scheduledNotificationId) {
+      return;
+    }
+
+    try {
+      await Notifications.cancelScheduledNotificationAsync(scheduledNotificationId);
+    } catch {
+      Alert.alert("Notification warning", "Could not cancel the scheduled timer alarm.");
+    } finally {
+      setScheduledNotificationId(null);
+    }
+  };
+
+  const scheduleTimerNotification = async (secondsUntilFire: number, purpose: string) => {
+    try {
+      const settings = await Notifications.getPermissionsAsync();
+      let finalStatus = settings.status;
+
+      if (finalStatus !== "granted") {
+        const requested = await Notifications.requestPermissionsAsync();
+        finalStatus = requested.status;
+      }
+
+      if (finalStatus !== "granted") {
+        Alert.alert(
+          "Notifications disabled",
+          "Background alarm needs notification permission. The timer will still stay accurate."
+        );
+        return;
+      }
+
+      await cancelScheduledTimerNotification();
+
+      const purposeSuffix = purpose.trim() ? ` Purpose: ${purpose.trim()}.` : "";
+      const notificationId = await Notifications.scheduleNotificationAsync({
+        content: {
+          title: "KickTalk timer complete",
+          body: `Time is up.${purposeSuffix}`,
+          sound: true,
+          priority: Notifications.AndroidNotificationPriority.MAX,
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+          seconds: Math.max(1, Math.ceil(secondsUntilFire)),
+        },
+      });
+
+      setScheduledNotificationId(notificationId);
+    } catch {
+      Alert.alert("Notification warning", "Could not schedule the background timer alarm.");
+    }
+  };
 
   const parsedHistoryCount = parseInputNumber(historyDisplayCountInput);
   const historyDisplayCount = parsedHistoryCount > 0 ? Math.min(parsedHistoryCount, 15) : 3;
@@ -106,9 +186,10 @@ export default function App() {
   useEffect(() => {
     const loadPersistedData = async () => {
       try {
-        const [storedPresets, storedHistory] = await Promise.all([
+        const [storedPresets, storedHistory, storedTimerState] = await Promise.all([
           AsyncStorage.getItem(SAVED_PRESETS_KEY),
           AsyncStorage.getItem(HISTORY_KEY),
+          AsyncStorage.getItem(TIMER_STATE_KEY),
         ]);
 
         if (storedPresets) {
@@ -122,6 +203,16 @@ export default function App() {
         if (storedHistory) {
           const parsed = JSON.parse(storedHistory) as SessionHistoryItem[];
           setSessionHistory(parsed);
+        }
+        if (storedTimerState) {
+          const parsed = JSON.parse(storedTimerState) as PersistedTimerState;
+          setTotalSeconds(parsed.totalSeconds);
+          setRemainingSeconds(parsed.remainingSeconds);
+          setIsRunning(parsed.isRunning);
+          setHasStartedTicking(parsed.hasStartedTicking);
+          setActivePurpose(parsed.activePurpose);
+          setTargetEndTimeMs(parsed.targetEndTimeMs);
+          setScheduledNotificationId(parsed.scheduledNotificationId);
         }
       } catch {
         Alert.alert("Storage warning", "Could not load saved presets/history.");
@@ -144,31 +235,36 @@ export default function App() {
   }, [sessionHistory]);
 
   useEffect(() => {
-    if (!isRunning) {
+    const timerState: PersistedTimerState = {
+      totalSeconds,
+      remainingSeconds,
+      isRunning,
+      hasStartedTicking,
+      activePurpose,
+      targetEndTimeMs,
+      scheduledNotificationId,
+    };
+
+    AsyncStorage.setItem(TIMER_STATE_KEY, JSON.stringify(timerState)).catch(() => {
+      Alert.alert("Storage warning", "Could not save active timer.");
+    });
+  }, [
+    activePurpose,
+    hasStartedTicking,
+    isRunning,
+    remainingSeconds,
+    scheduledNotificationId,
+    targetEndTimeMs,
+    totalSeconds,
+  ]);
+
+  const onTimerComplete = async (completedDurationSeconds: number, completedPurpose: string) => {
+    if (completionInFlightRef.current) {
       return;
     }
+    completionInFlightRef.current = true;
 
-    const intervalId = setInterval(() => {
-      setRemainingSeconds((current) => {
-        if (current <= 1) {
-          void onTimerComplete();
-          return 0;
-        }
-        return current - 1;
-      });
-    }, 1000);
-
-    return () => clearInterval(intervalId);
-  }, [isRunning, totalSeconds, activePurpose, alertSound, vibrationEnabled, voiceEnabled]);
-
-  const progressRatio = useMemo(() => {
-    if (totalSeconds <= 0) {
-      return 0;
-    }
-    return remainingSeconds / totalSeconds;
-  }, [remainingSeconds, totalSeconds]);
-
-  const onTimerComplete = async () => {
+    const purposeForCompletion = completedPurpose.trim();
     const alertPrefixBySound: Record<AlertSoundOption, string> = {
       Chime: "Chime alert.",
       Bell: "Bell alert.",
@@ -182,8 +278,11 @@ export default function App() {
 
     setIsRunning(false);
     setHasStartedTicking(false);
+    setTargetEndTimeMs(null);
+    await cancelScheduledTimerNotification();
+    setRemainingSeconds(0);
     if (voiceEnabled) {
-      const purposeLine = effectivePurpose ? `. Purpose was ${effectivePurpose}.` : "";
+      const purposeLine = purposeForCompletion ? `. Purpose was ${purposeForCompletion}.` : "";
       Speech.stop();
       Speech.speak(`${alertPrefixBySound[alertSound]} Time is up${purposeLine}`);
     }
@@ -197,15 +296,66 @@ export default function App() {
         {
           id: `${Date.now()}`,
           completedAtIso: new Date().toISOString(),
-          durationSeconds: totalSeconds,
-          purpose: effectivePurpose || "none",
+          durationSeconds: completedDurationSeconds,
+          purpose: purposeForCompletion || "none",
         },
         ...current,
       ].slice(0, 15)
     );
 
     Alert.alert("Timer complete", "Great work. Session saved to history.");
+    completionInFlightRef.current = false;
   };
+
+  useEffect(() => {
+    if (!isRunning || targetEndTimeMs === null) {
+      return;
+    }
+
+    const syncCountdown = () => {
+      const nextRemainingSeconds = Math.max(
+        0,
+        Math.ceil((targetEndTimeMs - Date.now()) / 1000)
+      );
+      setRemainingSeconds(nextRemainingSeconds);
+
+      if (nextRemainingSeconds <= 0) {
+        void onTimerComplete(totalSeconds, activePurpose);
+      }
+    };
+
+    syncCountdown();
+    const intervalId = setInterval(syncCountdown, 500);
+
+    return () => clearInterval(intervalId);
+  }, [activePurpose, alertSound, isRunning, targetEndTimeMs, totalSeconds, vibrationEnabled, voiceEnabled]);
+
+  useEffect(() => {
+    const handleAppStateChange = (nextAppState: AppStateStatus) => {
+      if (nextAppState !== "active" || !isRunning || targetEndTimeMs === null) {
+        return;
+      }
+
+      const nextRemainingSeconds = Math.max(
+        0,
+        Math.ceil((targetEndTimeMs - Date.now()) / 1000)
+      );
+      setRemainingSeconds(nextRemainingSeconds);
+      if (nextRemainingSeconds <= 0) {
+        void onTimerComplete(totalSeconds, activePurpose);
+      }
+    };
+
+    const subscription = AppState.addEventListener("change", handleAppStateChange);
+    return () => subscription.remove();
+  }, [activePurpose, isRunning, targetEndTimeMs, totalSeconds]);
+
+  const progressRatio = useMemo(() => {
+    if (totalSeconds <= 0) {
+      return 0;
+    }
+    return remainingSeconds / totalSeconds;
+  }, [remainingSeconds, totalSeconds]);
 
   const applyCustomTimerAndPurpose = () => {
     const minutes = parseInputNumber(minutesInput);
@@ -219,6 +369,8 @@ export default function App() {
     const trimmedPurpose = purposeInput.trim();
     setIsRunning(false);
     setHasStartedTicking(false);
+    setTargetEndTimeMs(null);
+    setScheduledNotificationId(null);
     setTotalSeconds(nextDuration);
     setRemainingSeconds(nextDuration);
     setActivePurpose(trimmedPurpose);
@@ -230,6 +382,8 @@ export default function App() {
     setSecondsInput("00");
     setIsRunning(false);
     setHasStartedTicking(false);
+    setTargetEndTimeMs(null);
+    setScheduledNotificationId(null);
     setTotalSeconds(nextDuration);
     setRemainingSeconds(nextDuration);
     setActivePurpose(purposeInput.trim());
@@ -266,10 +420,25 @@ export default function App() {
   };
 
   const toggleTimer = () => {
+    if (isRunning) {
+      if (targetEndTimeMs !== null) {
+        const pausedRemainingSeconds = Math.max(
+          0,
+          Math.ceil((targetEndTimeMs - Date.now()) / 1000)
+        );
+        setRemainingSeconds(pausedRemainingSeconds);
+      }
+      setIsRunning(false);
+      setTargetEndTimeMs(null);
+      void cancelScheduledTimerNotification();
+      return;
+    }
+
+    const nextRemainingSeconds = remainingSeconds === 0 ? totalSeconds : remainingSeconds;
     if (remainingSeconds === 0) {
       setRemainingSeconds(totalSeconds);
     }
-    if (!isRunning && voiceEnabled) {
+    if (voiceEnabled) {
       const durationLabel = formatDurationForSpeech(totalSeconds);
       const purposeLine = effectivePurpose
         ? `Purpose: ${effectivePurpose}.`
@@ -277,16 +446,19 @@ export default function App() {
       Speech.stop();
       Speech.speak(`Timer for ${durationLabel}. ${purposeLine}`);
     }
-    if (!isRunning) {
-      setHasStartedTicking(true);
-    }
-    setIsRunning((current) => !current);
+    setHasStartedTicking(true);
+    setIsRunning(true);
+    const nextTargetEndTimeMs = Date.now() + nextRemainingSeconds * 1000;
+    setTargetEndTimeMs(nextTargetEndTimeMs);
+    void scheduleTimerNotification(nextRemainingSeconds, effectivePurpose);
   };
 
   const resetTimer = () => {
     setIsRunning(false);
     setRemainingSeconds(totalSeconds);
     setHasStartedTicking(false);
+    setTargetEndTimeMs(null);
+    void cancelScheduledTimerNotification();
   };
 
   const applyHistoryAsNewTimer = (session: SessionHistoryItem) => {
@@ -294,6 +466,8 @@ export default function App() {
     const secs = session.durationSeconds % 60;
     setIsRunning(false);
     setHasStartedTicking(false);
+    setTargetEndTimeMs(null);
+    setScheduledNotificationId(null);
     setTotalSeconds(session.durationSeconds);
     setRemainingSeconds(session.durationSeconds);
     setMinutesInput(String(mins));

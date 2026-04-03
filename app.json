@@ -23,6 +23,9 @@
     "android": {
       "package": "com.kicktalk.timer",
       "versionCode": 1,
+      "permissions": [
+        "VIBRATE"
+      ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
@@ -38,6 +41,9 @@
         "projectId": "d27a950c-1251-47bc-814c-80788635bf72"
       }
     },
-    "owner": "sxinkang"
+    "owner": "sxinkang",
+    "plugins": [
+      "expo-notifications"
+    ]
   }
 }
