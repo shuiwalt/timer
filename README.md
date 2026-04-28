@@ -55,3 +55,8 @@ These settings are already included so you do not lose work:
 
 Use this checklist when you are ready:
 - [iOS Release Checklist](./IOS_RELEASE_CHECKLIST.md)
+
+## 6) Android command-line guide
+
+Use this when you want to package, deploy, launch, or test the Android app from Windows PowerShell:
+- [Android Windows Command-Line Guide](./ANDROID_WINDOWS_COMMAND_LINE_GUIDE.md)

@@ -73,6 +73,19 @@ const formatDurationForSpeech = (seconds: number) => {
   return parts.length > 0 ? parts.join(" ") : "0 seconds";
 };
 
+const normalizePurposeForSpeech = (purpose: string) =>
+  purpose.replace(/\s+/g, " ").trim();
+
+const formatPurposeForSpeech = (purpose: string) => {
+  const trimmedPurpose = normalizePurposeForSpeech(purpose);
+  return trimmedPurpose ? `Purpose: ${trimmedPurpose}.` : "No purpose set.";
+};
+
+const wait = (milliseconds: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+
 const parseInputNumber = (input: string) => {
   const parsed = Number.parseInt(input.trim(), 10);
   if (Number.isNaN(parsed) || parsed < 0) {
@@ -120,7 +133,108 @@ export default function App() {
   const [showAlertSoundDropdown, setShowAlertSoundDropdown] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [vibrationEnabled, setVibrationEnabled] = useState(true);
+  const [speechVoiceId, setSpeechVoiceId] = useState<string | undefined>(undefined);
+  const [speechLanguage, setSpeechLanguage] = useState("en-US");
+  const [speechStatus, setSpeechStatus] = useState("Checking speech engine...");
   const completionInFlightRef = useRef(false);
+  const speechAttemptIdRef = useRef(0);
+
+  const trySpeakOnceAsync = (normalizedText: string) =>
+    new Promise<boolean>((resolve) => {
+      const attemptId = ++speechAttemptIdRef.current;
+      let settled = false;
+
+      const updateSpeechAttemptStatus = (status: string) => {
+        if (speechAttemptIdRef.current === attemptId) {
+          setSpeechStatus(status);
+        }
+      };
+
+      const settle = (didStart: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(fallbackTimer);
+        resolve(didStart);
+      };
+
+      const fallbackTimer = setTimeout(() => {
+        void Speech.isSpeakingAsync()
+          .then((isSpeaking) => {
+            if (isSpeaking) {
+              updateSpeechAttemptStatus("Speech started.");
+            }
+            settle(isSpeaking);
+          })
+          .catch(() => {
+            settle(false);
+          });
+      }, 1200);
+
+      try {
+        Speech.speak(normalizedText, {
+          language: speechLanguage,
+          voice: speechVoiceId,
+          pitch: 1,
+          rate: 0.95,
+          volume: 1,
+          onStart: () => {
+            updateSpeechAttemptStatus("Speech started.");
+            settle(true);
+          },
+          onDone: () => {
+            updateSpeechAttemptStatus("Speech finished.");
+            settle(true);
+          },
+          onStopped: () => {
+            updateSpeechAttemptStatus("Speech stopped.");
+            settle(false);
+          },
+          onError: (error) => {
+            updateSpeechAttemptStatus(
+              `Speech error: ${error instanceof Error ? error.message : "unknown error"}`
+            );
+            settle(false);
+          },
+        });
+      } catch (error) {
+        updateSpeechAttemptStatus(
+          `Speech error: ${error instanceof Error ? error.message : "unknown error"}`
+        );
+        settle(false);
+      }
+    });
+
+  const speakTextAsync = async (text: string) => {
+    const normalizedText = text.replace(/\s+/g, " ").trim();
+    if (!voiceEnabled || !normalizedText) {
+      return;
+    }
+
+    const retryDelaysMs = [120, 420, 900];
+
+    for (let attemptIndex = 0; attemptIndex < retryDelaysMs.length; attemptIndex += 1) {
+      if (attemptIndex > 0) {
+        setSpeechStatus(
+          `Retrying speech engine (${attemptIndex + 1}/${retryDelaysMs.length})...`
+        );
+      }
+
+      try {
+        await Speech.stop();
+      } catch {}
+
+      await wait(retryDelaysMs[attemptIndex]);
+
+      const didStart = await trySpeakOnceAsync(normalizedText);
+      if (didStart) {
+        return;
+      }
+    }
+
+    setSpeechStatus("Speech failed to start. Please reopen the app or verify Android TTS settings.");
+  };
 
   const cancelScheduledTimerNotification = async () => {
     if (!scheduledNotificationId) {
@@ -223,6 +337,56 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let isMounted = true;
+
+    const loadSpeechVoice = async () => {
+      const retryDelaysMs = [0, 500, 1200];
+
+      for (const delayMs of retryDelaysMs) {
+        if (delayMs > 0) {
+          await wait(delayMs);
+        }
+
+        try {
+          const voices = await Speech.getAvailableVoicesAsync();
+          if (!isMounted) {
+            return;
+          }
+
+          const preferredVoice =
+            voices.find((voice) => voice.language.toLowerCase().startsWith("en-us")) ??
+            voices.find((voice) => voice.language.toLowerCase().startsWith("en")) ??
+            voices[0];
+
+          if (!preferredVoice) {
+            setSpeechStatus("Speech engine ready, but no voices were reported by Android.");
+            return;
+          }
+
+          setSpeechVoiceId(preferredVoice.identifier);
+          setSpeechLanguage(preferredVoice.language || "en-US");
+          setSpeechStatus(`Speech ready: ${preferredVoice.name} (${preferredVoice.language}).`);
+          return;
+        } catch {}
+      }
+
+      if (!isMounted) {
+        return;
+      }
+
+      setSpeechVoiceId(undefined);
+      setSpeechLanguage("en-US");
+      setSpeechStatus("Speech voice list unavailable. Android will use its default voice if available.");
+    };
+
+    void loadSpeechVoice();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
     AsyncStorage.setItem(SAVED_PRESETS_KEY, JSON.stringify(presetMinutes)).catch(() => {
       Alert.alert("Storage warning", "Could not save presets.");
     });
@@ -282,9 +446,8 @@ export default function App() {
     await cancelScheduledTimerNotification();
     setRemainingSeconds(0);
     if (voiceEnabled) {
-      const purposeLine = purposeForCompletion ? `. Purpose was ${purposeForCompletion}.` : "";
-      Speech.stop();
-      Speech.speak(`${alertPrefixBySound[alertSound]} Time is up${purposeLine}`);
+      const purposeLine = formatPurposeForSpeech(purposeForCompletion);
+      await speakTextAsync(`${purposeLine} ${alertPrefixBySound[alertSound]} Time is up.`);
     }
     if (vibrationEnabled) {
       Vibration.vibrate(vibrationPatternBySound[alertSound]);
@@ -421,36 +584,52 @@ export default function App() {
 
   const toggleTimer = () => {
     if (isRunning) {
+      const purposeForPause = activePurpose.trim();
+      let pausedRemainingSeconds = remainingSeconds;
+
       if (targetEndTimeMs !== null) {
-        const pausedRemainingSeconds = Math.max(
+        pausedRemainingSeconds = Math.max(
           0,
           Math.ceil((targetEndTimeMs - Date.now()) / 1000)
         );
         setRemainingSeconds(pausedRemainingSeconds);
       }
+
       setIsRunning(false);
       setTargetEndTimeMs(null);
       void cancelScheduledTimerNotification();
+
+      if (voiceEnabled) {
+        void speakTextAsync(
+          `${formatPurposeForSpeech(
+            purposeForPause
+          )} Timer paused with ${formatDurationForSpeech(pausedRemainingSeconds)} remaining.`
+        );
+      }
       return;
     }
 
     const nextRemainingSeconds = remainingSeconds === 0 ? totalSeconds : remainingSeconds;
+    const purposeForRun = effectivePurpose.trim();
+    const isResuming =
+      hasStartedTicking && remainingSeconds > 0 && remainingSeconds < totalSeconds;
+
     if (remainingSeconds === 0) {
       setRemainingSeconds(totalSeconds);
     }
+    setActivePurpose(purposeForRun);
     if (voiceEnabled) {
-      const durationLabel = formatDurationForSpeech(totalSeconds);
-      const purposeLine = effectivePurpose
-        ? `Purpose: ${effectivePurpose}.`
-        : "No purpose set.";
-      Speech.stop();
-      Speech.speak(`Timer for ${durationLabel}. ${purposeLine}`);
+      const durationLabel = formatDurationForSpeech(nextRemainingSeconds);
+      const actionLabel = isResuming ? "Resuming timer" : "Starting timer";
+      void speakTextAsync(
+        `${formatPurposeForSpeech(purposeForRun)} ${actionLabel} for ${durationLabel}.`
+      );
     }
     setHasStartedTicking(true);
     setIsRunning(true);
     const nextTargetEndTimeMs = Date.now() + nextRemainingSeconds * 1000;
     setTargetEndTimeMs(nextTargetEndTimeMs);
-    void scheduleTimerNotification(nextRemainingSeconds, effectivePurpose);
+    void scheduleTimerNotification(nextRemainingSeconds, purposeForRun);
   };
 
   const resetTimer = () => {
@@ -481,8 +660,7 @@ export default function App() {
     const finalMessage =
       "Thank you for your time! Message well received. We will get back to you within 24 hours.";
     Alert.alert("Q&A submitted", finalMessage);
-    Speech.stop();
-    Speech.speak(finalMessage);
+    void speakTextAsync(finalMessage);
     setQaMessage("");
   };
 
@@ -630,6 +808,7 @@ export default function App() {
           <Text style={styles.helperText}>
             Select alert sound style and enable voice/vibration as needed.
           </Text>
+          <Text style={styles.helperText}>Speech status: {speechStatus}</Text>
           <Pressable
             style={styles.dropdownHeader}
             onPress={() => setShowAlertSoundDropdown((current) => !current)}
