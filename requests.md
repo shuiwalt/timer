@@ -26,3 +26,8 @@
 - Walt asked Aco to investigate and fix the issue where KickTalk timer was not speaking the timer purpose clearly at the beginning and end of a session in the Android emulator.
 - Walt reported that even after earlier speech changes, the emulator still only played a small click at the beginning and end instead of spoken words, and asked Aco to keep investigating.
 - Walt asked Aco to verify the emulator `config.ini` audio settings, compare them against the app's approach, and work out a tested method that actually makes spoken timer text work in the emulator.
+
+## 2026-05-05
+
+- Walt asked Aco to check the current work into the remote repo.
+- Walt asked Aco to bring up the Android emulator `TimerManual35` with KickTalk timer.
