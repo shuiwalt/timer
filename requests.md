@@ -31,3 +31,7 @@
 
 - Walt asked Aco to check the current work into the remote repo.
 - Walt asked Aco to bring up the Android emulator `TimerManual35` with KickTalk timer.
+- Walt asked Aco to deploy the KickTalk timer code through Expo and make whatever setup changes are needed to get it working.
+- Walt asked Aco how to make Expo testing work for the Apple/iOS side of the KickTalk timer code.
+- Walt asked Aco to wire `expo-dev-client` into the repo and prepare the iOS EAS profiles so the iPhone Expo testing path is ready.
+- Walt asked Aco to actually run the Windows-compatible Expo iOS steps: start an EAS iPhone development build, start Metro in dev-client mode, and try the simulator build command from Windows.
